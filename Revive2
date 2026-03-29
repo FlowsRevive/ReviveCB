@@ -1,0 +1,1482 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+local mouse = LocalPlayer:GetMouse()
+
+-- ==========================================
+-- SCRIPT CONFIGURATION
+-- ==========================================
+
+-- Configuration for highlight colors
+local TEAMMATE_COLOR = Color3.new(0, 1, 0) -- Green
+local ENEMY_COLOR = Color3.new(1, 0, 0)    -- Red
+local NEUTRAL_COLOR = Color3.new(1, 1, 1)  -- White for games without teams
+local OCCLUDED_COLOR = Color3.new(0.5, 0.5, 0.5) -- Grey for players behind walls
+
+-- Feature Flags controlled by the UI
+local espEnabled = false
+local textEspEnabled = false
+local espDrawings = {}
+local tracersEnabled = false
+local tracerColor = Color3.fromRGB(255, 255, 0) -- Default Yellow
+
+local autoShootEnabled = false
+local autoCrouchEnabled = false
+local crouchKey = Enum.KeyCode.C
+local isCurrentlyCrouched = false
+
+local recoilControlEnabled = false
+local recoilStrength = 5
+local recoilMethod = "Camera"
+local rcsPattern = "Standard (Pull Down)"
+local sprayStartTime = 0
+
+local isShooting = false
+local lastAutoShootTime = 0
+local fovCircleEnabled = false
+local fovRadius = 100
+local gameMode = "Team Based" 
+local aimPartChoice = "Head"  
+local currentTargetEnemy = nil 
+local currentRandomPart = nil
+
+-- Aesthetic Visual Flags
+local hologramArmsEnabled = false
+local hologramColor = Color3.fromRGB(255, 105, 180) -- Default Pink
+local hologramStyle = "ForceField Aura" 
+local galaxySkyboxEnabled = false
+local galaxyVariant = "Nebula (Purple/Pink)" 
+local origLighting = {}
+local galaxyEffects = {}
+
+-- Variables for Aimbot Smoothing
+local aimSmoothing = 0.4
+local aimMethod = "Camera"
+
+-- Variables for Camera & Audio
+local cameraFovEnabled = false
+local cameraFovValue = 90
+local hitSoundEnabled = false
+local hitSoundChoice = "Satisfying Bell"
+local hitSound = Instance.new("Sound")
+hitSound.SoundId = "rbxassetid://1347140027" -- Default Satisfying Bell
+hitSound.Volume = 2
+hitSound.Parent = game:GetService("SoundService")
+
+-- Variables for Reaction Delay
+local triggerDelay = 0         
+local timeInSight = 0          
+local lastSeenEnemy = nil      
+
+-- Store connections for clean removal later
+local connections = {}
+
+-- Initialize FOV Circle
+local fovCircle = nil
+if Drawing then
+    fovCircle = Drawing.new("Circle")
+    fovCircle.Visible = false
+    fovCircle.Thickness = 1.5
+    fovCircle.Color = Color3.new(1, 1, 1)
+    fovCircle.Filled = false
+    fovCircle.Transparency = 1
+    fovCircle.Radius = fovRadius
+end
+
+-- ==========================================
+-- CORE FUNCTIONS
+-- ==========================================
+
+local function createTracer(startPos, endPos)
+    local distance = (endPos - startPos).Magnitude
+    local tracer = Instance.new("Part")
+    tracer.Anchored = true
+    tracer.CanCollide = false
+    tracer.Material = Enum.Material.Neon
+    tracer.Color = tracerColor
+    tracer.Transparency = 0.1
+    tracer.Size = Vector3.new(0.04, 0.04, distance)
+    tracer.CFrame = CFrame.lookAt(startPos, endPos) * CFrame.new(0, 0, -distance / 2)
+    tracer.CastShadow = false
+    tracer.Parent = workspace
+    
+    local tweenInfo = TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+    local tween = TweenService:Create(tracer, tweenInfo, {
+        Transparency = 1, 
+        Size = Vector3.new(0, 0, distance)
+    })
+    
+    tween:Play()
+    tween.Completed:Connect(function()
+        tracer:Destroy()
+    end)
+end
+
+local function getTracerOrigin()
+    local character = LocalPlayer.Character
+    if character then
+        local tool = character:FindFirstChildOfClass("Tool")
+        if tool then
+            local name = string.lower(tool.Name)
+            local ignoredWeapons = {"knife", "karambit", "bayonet", "butterfly", "c4", "bomb", "grenade", "smoke", "flashbang", "molotov", "decoy", "melee"}
+            for _, ignored in ipairs(ignoredWeapons) do
+                if name:find(ignored) then return nil end 
+            end
+        end
+    end
+
+    local camera = workspace.CurrentCamera
+    local viewModel = camera:FindFirstChild("ViewModel") or camera:FindFirstChild("Arms") or camera:FindFirstChildWhichIsA("Model")
+    
+    if viewModel then
+        for _, child in ipairs(viewModel:GetChildren()) do
+            local cName = string.lower(child.Name)
+            if cName:find("knife") or cName:find("c4") or cName:find("grenade") then 
+                return nil 
+            end
+        end
+        for _, part in ipairs(viewModel:GetDescendants()) do
+            if part:IsA("BasePart") then
+                local lname = part.Name:lower()
+                if lname:find("barrel") or lname:find("muzzle") or lname:find("flash") then
+                    return part.Position
+                end
+            end
+        end
+    end
+
+    if character then
+        local tool = character:FindFirstChildOfClass("Tool")
+        if tool and tool:FindFirstChild("Handle") then
+            return tool.Handle.Position
+        end
+    end
+
+    return workspace.CurrentCamera.CFrame.Position - Vector3.new(0, 0.5, 0)
+end
+
+table.insert(connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        isShooting = true
+        sprayStartTime = os.clock()
+        
+        -- Spectator Bug Fix
+        if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("Humanoid") or LocalPlayer.Character.Humanoid.Health <= 0 then
+            return
+        end
+        
+        if not tracersEnabled then return end
+        
+        local startPos = getTracerOrigin()
+        if startPos then 
+            createTracer(startPos, mouse.Hit.Position)
+        end
+    end
+end))
+
+table.insert(connections, UserInputService.InputEnded:Connect(function(input, gameProcessed)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        isShooting = false
+    end
+end))
+
+-- UPGRADED: Multipoint Hitbox & Smart Penetration Raycasting
+local function isPointVisible(character, pointPos)
+    local camera = workspace.CurrentCamera
+    local origin = camera.CFrame.Position
+    local direction = pointPos - origin
+
+    local raycastParams = RaycastParams.new()
+    local ignoreList = {LocalPlayer.Character, camera}
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+    raycastParams.IgnoreWater = true
+
+    local maxRetries = 30
+    local retries = 0
+
+    while retries < maxRetries do
+        raycastParams.FilterDescendantsInstances = ignoreList
+        local result = workspace:Raycast(origin, direction, raycastParams)
+
+        if result then
+            if result.Instance:IsDescendantOf(character) then
+                return true
+            else
+                local inst = result.Instance
+                local name = string.lower(inst.Name)
+                
+                local isInvisible = inst.Transparency >= 0.5
+                local isNonSolid = not inst.CanCollide
+                local isGlass = inst.Material == Enum.Material.Glass
+                local isMapClip = name:find("clip") or name:find("fence") or name:find("rail") or name:find("grate") or name:find("window") or name:find("transparent") or name:find("shoot") or name:find("bars") or name:find("mesh") or name:find("wire") or name:find("gate") or name:find("chain") or name:find("pole") or name:find("ladder") or name:find("step") or name:find("stair")
+                
+                if isInvisible or isNonSolid or isGlass or isMapClip then
+                    table.insert(ignoreList, inst)
+                    retries = retries + 1
+                else
+                    return false 
+                end
+            end
+        else
+            return true
+        end
+    end
+    return false
+end
+
+local function isCharacterVisible(character, specificPart)
+    if specificPart then
+        local offsets = {
+            Vector3.new(0, 0, 0), -- Center
+            Vector3.new(specificPart.Size.X / 2.5, 0, 0), -- Right
+            Vector3.new(-specificPart.Size.X / 2.5, 0, 0), -- Left
+            Vector3.new(0, specificPart.Size.Y / 2.5, 0), -- Top
+            Vector3.new(0, -specificPart.Size.Y / 2.5, 0) -- Bottom
+        }
+        
+        for _, offset in ipairs(offsets) do
+            local pointPos = specificPart.CFrame * offset
+            if isPointVisible(character, pointPos) then
+                return true, pointPos
+            end
+        end
+        return false, nil
+    end
+    
+    local partsToCheck = {"Head", "HumanoidRootPart", "UpperTorso", "LowerTorso"}
+    for _, partName in ipairs(partsToCheck) do
+        local p = character:FindFirstChild(partName)
+        if p and isPointVisible(character, p.Position) then
+            return true, p.Position
+        end
+    end
+    return false, nil
+end
+
+local function updateHighlight(player)
+    if player == LocalPlayer then return end
+
+    local character = player.Character
+    if not character then return end
+
+    local highlight = character:FindFirstChild("PlayerHighlight")
+
+    if not espEnabled then
+        if highlight then highlight:Destroy() end
+        return
+    end
+
+    if not highlight then
+        highlight = Instance.new("Highlight")
+        highlight.Name = "PlayerHighlight"
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop 
+        highlight.FillTransparency = 0.5
+        highlight.OutlineTransparency = 0
+        highlight.OutlineColor = Color3.new(1, 1, 1)
+        highlight.Parent = character
+    end
+end
+
+-- Handle Galaxy Skybox and Lighting
+local function applyGalaxyLighting(enable)
+    for _, effect in ipairs(galaxyEffects) do
+        if effect then effect:Destroy() end
+    end
+    table.clear(galaxyEffects)
+
+    if enable then
+        if not origLighting.Saved then
+            origLighting.Ambient = Lighting.Ambient
+            origLighting.OutdoorAmbient = Lighting.OutdoorAmbient
+            origLighting.ClockTime = Lighting.ClockTime
+            origLighting.Brightness = Lighting.Brightness
+            origLighting.ExposureCompensation = Lighting.ExposureCompensation
+            origLighting.FogColor = Lighting.FogColor
+            origLighting.FogEnd = Lighting.FogEnd
+            origLighting.FogStart = Lighting.FogStart
+            origLighting.Saved = true
+        end
+
+        local bloom = Instance.new("BloomEffect")
+        bloom.Name = "GalaxyBloom"
+        bloom.Parent = Lighting
+        table.insert(galaxyEffects, bloom)
+
+        local cc = Instance.new("ColorCorrectionEffect")
+        cc.Name = "GalaxyColorCorrection"
+        cc.Parent = Lighting
+        table.insert(galaxyEffects, cc)
+
+        local sky = Instance.new("Sky")
+        sky.Name = "GalaxySky"
+        sky.SunTextureId = ""
+        sky.Parent = Lighting
+        table.insert(galaxyEffects, sky)
+
+        if galaxyVariant == "Nebula (Purple/Pink)" then
+            Lighting.Ambient = Color3.fromRGB(120, 70, 180)
+            Lighting.OutdoorAmbient = Color3.fromRGB(100, 50, 150)
+            Lighting.Brightness = 2.5
+            Lighting.ClockTime = 20
+            Lighting.ExposureCompensation = 0.5
+            Lighting.FogColor = Color3.fromRGB(80, 20, 120)
+            Lighting.FogEnd = 800
+            Lighting.FogStart = 100
+            
+            bloom.Intensity = 1.2
+            bloom.Size = 24
+            bloom.Threshold = 0.8
+            
+            cc.TintColor = Color3.fromRGB(255, 230, 255)
+            cc.Contrast = 0.1
+            
+            sky.SkyboxUp = "rbxassetid://159454288"
+            sky.SkyboxDn = "rbxassetid://159454296"
+            sky.SkyboxFt = "rbxassetid://159454293"
+            sky.SkyboxBk = "rbxassetid://159454299"
+            sky.SkyboxLf = "rbxassetid://159454286"
+            sky.SkyboxRt = "rbxassetid://159454300"
+            
+        elseif galaxyVariant == "Deep Space (Cyan/Dark)" then
+            Lighting.Ambient = Color3.fromRGB(10, 25, 50)
+            Lighting.OutdoorAmbient = Color3.fromRGB(5, 15, 35)
+            Lighting.Brightness = 1.5
+            Lighting.ClockTime = 0
+            Lighting.ExposureCompensation = 0.2
+            Lighting.FogColor = Color3.fromRGB(5, 10, 20)
+            Lighting.FogEnd = 500
+            Lighting.FogStart = 50
+            
+            bloom.Intensity = 0.8
+            bloom.Size = 12
+            bloom.Threshold = 0.95
+            
+            cc.TintColor = Color3.fromRGB(200, 230, 255)
+            cc.Contrast = 0.15
+            
+            sky.SkyboxUp = "rbxassetid://218955819"
+            sky.SkyboxDn = "rbxassetid://218953419"
+            sky.SkyboxFt = "rbxassetid://218954524"
+            sky.SkyboxBk = "rbxassetid://218953122"
+            sky.SkyboxLf = "rbxassetid://218958493"
+            sky.SkyboxRt = "rbxassetid://218957134"
+            
+        elseif galaxyVariant == "Synthwave (Neon/Retro)" then
+            Lighting.Ambient = Color3.fromRGB(200, 50, 150)
+            Lighting.OutdoorAmbient = Color3.fromRGB(150, 20, 200)
+            Lighting.Brightness = 3.5
+            Lighting.ClockTime = 18
+            Lighting.ExposureCompensation = 0.8
+            Lighting.FogColor = Color3.fromRGB(255, 0, 150)
+            Lighting.FogEnd = 600
+            Lighting.FogStart = 20
+            
+            bloom.Intensity = 1.5
+            bloom.Size = 30
+            bloom.Threshold = 1.2
+            
+            cc.TintColor = Color3.fromRGB(255, 150, 255)
+            cc.Contrast = 0.3
+            cc.Saturation = 0.5
+            
+            sky.SkyboxUp = "rbxassetid://218955819"
+            sky.SkyboxDn = "rbxassetid://218953419"
+            sky.SkyboxFt = "rbxassetid://218954524"
+            sky.SkyboxBk = "rbxassetid://218953122"
+            sky.SkyboxLf = "rbxassetid://218958493"
+            sky.SkyboxRt = "rbxassetid://218957134"
+            
+        elseif galaxyVariant == "Crimson Eclipse (Red)" then
+            Lighting.Ambient = Color3.fromRGB(180, 20, 20)
+            Lighting.OutdoorAmbient = Color3.fromRGB(150, 0, 0)
+            Lighting.Brightness = 3
+            Lighting.ClockTime = 17
+            Lighting.ExposureCompensation = 0.5
+            Lighting.FogColor = Color3.fromRGB(120, 0, 0)
+            Lighting.FogEnd = 400
+            Lighting.FogStart = 10
+            
+            bloom.Intensity = 1.2
+            bloom.Size = 20
+            bloom.Threshold = 1.5
+            
+            cc.TintColor = Color3.fromRGB(255, 100, 100)
+            cc.Contrast = 0.4
+            cc.Saturation = 0.6
+            
+            sky.SkyboxUp = "rbxassetid://159454288"
+            sky.SkyboxDn = "rbxassetid://159454296"
+            sky.SkyboxFt = "rbxassetid://159454293"
+            sky.SkyboxBk = "rbxassetid://159454299"
+            sky.SkyboxLf = "rbxassetid://159454286"
+            sky.SkyboxRt = "rbxassetid://159454300"
+            
+        elseif galaxyVariant == "Matrix (Hacker Green)" then
+            Lighting.Ambient = Color3.fromRGB(10, 50, 10)
+            Lighting.OutdoorAmbient = Color3.fromRGB(0, 30, 0)
+            Lighting.Brightness = 2.0
+            Lighting.ClockTime = 12
+            Lighting.ExposureCompensation = 0.5
+            Lighting.FogColor = Color3.fromRGB(0, 255, 50)
+            Lighting.FogEnd = 400
+            Lighting.FogStart = 10
+            
+            bloom.Intensity = 2.0
+            bloom.Size = 35
+            bloom.Threshold = 0.5
+            
+            cc.TintColor = Color3.fromRGB(100, 255, 100)
+            cc.Contrast = 0.4
+            cc.Saturation = 0.8
+            
+        elseif galaxyVariant == "Abyssal Ocean (Deep Blue)" then
+            Lighting.Ambient = Color3.fromRGB(0, 10, 30)
+            Lighting.OutdoorAmbient = Color3.fromRGB(0, 5, 20)
+            Lighting.Brightness = 1.0
+            Lighting.ClockTime = 0
+            Lighting.ExposureCompensation = 0.3
+            Lighting.FogColor = Color3.fromRGB(0, 50, 100)
+            Lighting.FogEnd = 300
+            Lighting.FogStart = 0
+            
+            bloom.Intensity = 1.0
+            bloom.Size = 20
+            bloom.Threshold = 1.0
+            
+            cc.TintColor = Color3.fromRGB(100, 150, 255)
+            cc.Contrast = 0.2
+            cc.Saturation = 0.5
+            
+        elseif galaxyVariant == "Void (Pitch Black)" then
+            Lighting.Ambient = Color3.fromRGB(0, 0, 0)
+            Lighting.OutdoorAmbient = Color3.fromRGB(0, 0, 0)
+            Lighting.Brightness = 0
+            Lighting.ClockTime = 0
+            Lighting.ExposureCompensation = -1
+            Lighting.FogColor = Color3.fromRGB(0, 0, 0)
+            Lighting.FogEnd = 150
+            Lighting.FogStart = 0
+            
+            bloom.Intensity = 0
+            
+            cc.TintColor = Color3.fromRGB(150, 150, 150)
+            cc.Contrast = 0.8
+            cc.Saturation = -1
+        end
+    else
+        if origLighting.Saved then
+            Lighting.Ambient = origLighting.Ambient
+            Lighting.OutdoorAmbient = origLighting.OutdoorAmbient
+            Lighting.ClockTime = origLighting.ClockTime
+            Lighting.Brightness = origLighting.Brightness
+            Lighting.ExposureCompensation = origLighting.ExposureCompensation
+            Lighting.FogColor = origLighting.FogColor
+            Lighting.FogEnd = origLighting.FogEnd
+            Lighting.FogStart = origLighting.FogStart
+        end
+    end
+end
+
+-- Throttled Background Updates
+local backgroundUpdateTimer = 0
+table.insert(connections, RunService.Heartbeat:Connect(function(deltaTime)
+    backgroundUpdateTimer = backgroundUpdateTimer + deltaTime
+    if backgroundUpdateTimer < 0.15 then return end 
+    backgroundUpdateTimer = 0
+
+    -- ESP Updates
+    if espEnabled then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player == LocalPlayer then continue end
+            
+            local character = player.Character
+            if not character then continue end
+            
+            local highlight = character:FindFirstChild("PlayerHighlight")
+            if not highlight then continue end
+
+            local isVisible = isCharacterVisible(character, nil)
+            
+            if isVisible then
+                if gameMode == "Free For All" then
+                    highlight.FillColor = ENEMY_COLOR
+                elseif LocalPlayer.Team and player.Team then
+                    if LocalPlayer.Team == player.Team then
+                        highlight.FillColor = TEAMMATE_COLOR
+                    else
+                        highlight.FillColor = ENEMY_COLOR
+                    end
+                else
+                    highlight.FillColor = NEUTRAL_COLOR
+                end
+            else
+                highlight.FillColor = OCCLUDED_COLOR
+            end
+        end
+    end
+
+    -- Hologram Arms / Viewmodel 
+    local camera = workspace.CurrentCamera
+    local viewLight = camera:FindFirstChild("ViewmodelLight")
+    
+    if hologramArmsEnabled then
+        if not viewLight then
+            viewLight = Instance.new("PointLight")
+            viewLight.Name = "ViewmodelLight"
+            viewLight.Parent = camera
+        end
+        viewLight.Enabled = true
+        viewLight.Color = hologramColor
+        viewLight.Range = 15
+        viewLight.Brightness = 4.0 
+        viewLight.Shadows = false
+    else
+        if viewLight then viewLight.Enabled = false end
+    end
+
+    if hologramArmsEnabled then
+        local viewModel = camera:FindFirstChild("ViewModel") or camera:FindFirstChild("Arms") or camera:FindFirstChildWhichIsA("Model")
+        if viewModel then
+            for _, part in ipairs(viewModel:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    
+                    local lname = part.Name:lower()
+                    if part.Transparency >= 0.95 and part.Material ~= Enum.Material.ForceField and part.Material ~= Enum.Material.Neon and part.Material ~= Enum.Material.Glass and part.Material ~= Enum.Material.Foil and part.Material ~= Enum.Material.Ice and part.Material ~= Enum.Material.SmoothPlastic and part.Material ~= Enum.Material.Metal and part.Material ~= Enum.Material.CorrodedMetal then continue end
+                    if lname:find("hitbox") or lname:find("aim") or lname:find("sight") or lname:find("camera") then continue end
+
+                    local targetMat = Enum.Material.Plastic
+                    local targetTrans = 0
+                    local targetReflect = 0
+                    local targetColor = hologramColor
+
+                    if hologramStyle == "Solid Neon" then
+                        targetMat = Enum.Material.Neon
+                        targetTrans = 0.1
+                        targetColor = Color3.new(hologramColor.R * 1.5, hologramColor.G * 1.5, hologramColor.B * 1.5)
+                    elseif hologramStyle == "ForceField Aura" then
+                        targetMat = Enum.Material.ForceField
+                        targetTrans = -0.5 
+                        targetColor = Color3.new(hologramColor.R * 2, hologramColor.G * 2, hologramColor.B * 2)
+                    elseif hologramStyle == "Glassy Ghost" then
+                        targetMat = Enum.Material.Glass
+                        targetTrans = 0.6
+                        targetReflect = 0.2
+                    elseif hologramStyle == "Golden Foil" then
+                        targetMat = Enum.Material.Foil
+                        targetTrans = 0
+                        targetReflect = 0.6 
+                    elseif hologramStyle == "Frozen Ice" then
+                        targetMat = Enum.Material.Ice
+                        targetTrans = 0.4
+                        targetReflect = 0.3
+                    elseif hologramStyle == "Smooth Plastic" then
+                        targetMat = Enum.Material.SmoothPlastic
+                        targetTrans = 0
+                        targetReflect = 0.1
+                    elseif hologramStyle == "Cyber-Chrome" then
+                        targetMat = Enum.Material.Metal
+                        targetTrans = 0
+                        targetReflect = 1.0 
+                    elseif hologramStyle == "Dark Matter" then
+                        targetMat = Enum.Material.Glass
+                        targetTrans = 0.7
+                        targetReflect = 0.1
+                        targetColor = Color3.new(hologramColor.R * 0.15, hologramColor.G * 0.15, hologramColor.B * 0.15)
+                    elseif hologramStyle == "Corroded Slime" then
+                        targetMat = Enum.Material.CorrodedMetal
+                        targetTrans = 0
+                        targetReflect = 0
+                    end
+                    
+                    if part.Material ~= targetMat then part.Material = targetMat end
+                    if part.Transparency ~= targetTrans then part.Transparency = targetTrans end
+                    if part.Reflectance ~= targetReflect then part.Reflectance = targetReflect end
+                    if part.Color ~= targetColor then part.Color = targetColor end
+                    
+                    if part:IsA("MeshPart") and part.TextureID ~= "" then
+                        part.TextureID = ""
+                    end
+                    
+                    for _, child in ipairs(part:GetChildren()) do
+                        if child:IsA("Texture") or child:IsA("Decal") or child:IsA("SurfaceAppearance") then
+                            child:Destroy()
+                        elseif child:IsA("SpecialMesh") and child.TextureId ~= "" then
+                            child.TextureId = ""
+                        end
+                    end
+                end
+            end
+        end
+    end
+end))
+
+-- Continuously update FOV, Aimbot, and Recoil
+table.insert(connections, RunService.RenderStepped:Connect(function(deltaTime)
+    local mouseLocationScreen = UserInputService:GetMouseLocation()
+    local mouseLocationViewport = Vector2.new(mouse.X, mouse.Y)
+    local camera = workspace.CurrentCamera
+    
+    if cameraFovEnabled then
+        camera.FieldOfView = cameraFovValue
+    end
+    
+    if fovCircle and fovCircleEnabled then
+        fovCircle.Position = mouseLocationScreen
+        fovCircle.Radius = fovRadius
+    end
+
+    -- Text & Health ESP
+    for plr, drawings in pairs(espDrawings) do
+        if not plr or not plr.Parent or not Players:FindFirstChild(plr.Name) then
+            if drawings then
+                if drawings.text then drawings.text:Remove() end
+                if drawings.bg then drawings.bg:Remove() end
+                if drawings.bar then drawings.bar:Remove() end
+                if drawings.outline then drawings.outline:Remove() end
+            end
+            espDrawings[plr] = nil
+        end
+    end
+
+    if textEspEnabled then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local drawings = espDrawings[player]
+                if not drawings and Drawing and typeof(Drawing.new) == "function" then
+                    local success = pcall(function()
+                        drawings = {}
+                        drawings.text = Drawing.new("Text")
+                        drawings.text.Size = 14
+                        drawings.text.Center = true
+                        drawings.text.Outline = true
+                        drawings.text.Font = 2 
+                        
+                        drawings.bg = Drawing.new("Square")
+                        drawings.bg.Filled = true
+                        drawings.bg.Color = Color3.new(0, 0, 0)
+                        drawings.bg.Transparency = 0.7
+                        
+                        drawings.bar = Drawing.new("Square")
+                        drawings.bar.Filled = true
+                        drawings.bar.Transparency = 1
+                        
+                        drawings.outline = Drawing.new("Square")
+                        drawings.outline.Filled = false
+                        drawings.outline.Color = Color3.new(0, 0, 0)
+                        drawings.outline.Thickness = 1
+                        drawings.outline.Transparency = 1
+                    end)
+                    
+                    if success and drawings and drawings.text and drawings.bg and drawings.bar and drawings.outline then
+                        espDrawings[player] = drawings
+                    else
+                        if drawings and drawings.text then drawings.text:Remove() end
+                        if drawings and drawings.bg then drawings.bg:Remove() end
+                        if drawings and drawings.bar then drawings.bar:Remove() end
+                        if drawings and drawings.outline then drawings.outline:Remove() end
+                        drawings = nil
+                    end
+                end
+                
+                if drawings then
+                    if player.Character and player.Character:FindFirstChild("Head") and player.Character:FindFirstChild("Humanoid") and player.Character.Humanoid.Health > 0 then
+                        local head = player.Character.Head
+                        local humanoid = player.Character.Humanoid
+                        local screenPos, onScreen = camera:WorldToViewportPoint(head.Position + Vector3.new(0, 1.5, 0))
+                        
+                        if onScreen then
+                            local distance = (camera.CFrame.Position - head.Position).Magnitude
+                            local distMeters = math.floor(distance / 3) 
+                            
+                            local maxHp = humanoid.MaxHealth
+                            if maxHp <= 0 then maxHp = 100 end
+                            local healthPct = math.clamp(humanoid.Health / maxHp, 0, 1)
+                            
+                            local barWidth = math.clamp(1500 / distance, 30, 80)
+                            local barHeight = 4
+                            local barX = screenPos.X - (barWidth / 2)
+                            local barY = screenPos.Y - 8 
+                            
+                            drawings.text.Text = string.format("%s [%dm]", player.Name, distMeters)
+                            drawings.text.Position = Vector2.new(screenPos.X, screenPos.Y)
+                            
+                            local highlight = player.Character:FindFirstChild("PlayerHighlight")
+                            if highlight then
+                                drawings.text.Color = highlight.FillColor
+                            else
+                                if gameMode == "Free For All" then drawings.text.Color = ENEMY_COLOR
+                                elseif LocalPlayer.Team and player.Team and LocalPlayer.Team == player.Team then drawings.text.Color = TEAMMATE_COLOR
+                                else drawings.text.Color = ENEMY_COLOR end
+                            end
+                            
+                            drawings.bg.Size = Vector2.new(barWidth, barHeight)
+                            drawings.bg.Position = Vector2.new(barX, barY)
+                            
+                            drawings.bar.Size = Vector2.new(barWidth * healthPct, barHeight)
+                            drawings.bar.Position = Vector2.new(barX, barY)
+                            drawings.bar.Color = Color3.new(1 - healthPct, healthPct, 0)
+                            
+                            drawings.outline.Size = Vector2.new(barWidth, barHeight)
+                            drawings.outline.Position = Vector2.new(barX, barY)
+                            
+                            drawings.text.Visible = true
+                            drawings.bg.Visible = true
+                            drawings.bar.Visible = true
+                            drawings.outline.Visible = true
+                        else
+                            drawings.text.Visible = false
+                            drawings.bg.Visible = false
+                            drawings.bar.Visible = false
+                            drawings.outline.Visible = false
+                        end
+                    else
+                        drawings.text.Visible = false
+                        drawings.bg.Visible = false
+                        drawings.bar.Visible = false
+                        drawings.outline.Visible = false
+                    end
+                end
+            end
+        end
+    else
+        for _, drawings in pairs(espDrawings) do
+            if drawings and drawings.text then 
+                drawings.text.Visible = false 
+                drawings.bg.Visible = false
+                drawings.bar.Visible = false
+                drawings.outline.Visible = false
+            end
+        end
+    end
+
+    -- Auto Shoot (TriggerBot with FOV & Aimbot)
+    local isAutoShooting = false
+    if autoShootEnabled then
+        local closestEnemy = nil
+        local bestTargetPart = nil
+        local bestTargetPos = nil
+        local shortestDistance = fovRadius
+        local camera = workspace.CurrentCamera
+        
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local isEnemy = true
+                if gameMode == "Team Based" then
+                    if LocalPlayer.Team and player.Team and LocalPlayer.Team == player.Team then
+                        isEnemy = false
+                    end
+                end
+                
+                if isEnemy and player.Character and player.Character:FindFirstChild("HumanoidRootPart") and player.Character:FindFirstChild("Humanoid") and player.Character.Humanoid.Health > 0 then
+                    
+                    local targetPart = nil
+                    if aimPartChoice == "Head" then
+                        targetPart = player.Character:FindFirstChild("Head") or player.Character.HumanoidRootPart
+                    elseif aimPartChoice == "Torso" then
+                        targetPart = player.Character.HumanoidRootPart
+                    elseif aimPartChoice == "Random" then
+                        if currentTargetEnemy == player.Character and currentRandomPart and currentRandomPart.Parent == player.Character then
+                            targetPart = currentRandomPart
+                        else
+                            local possibleParts = {}
+                            for _, name in ipairs({"Head", "HumanoidRootPart", "Left Arm", "Right Arm", "Left Leg", "Right Leg", "UpperTorso", "LowerTorso"}) do
+                                local p = player.Character:FindFirstChild(name)
+                                if p then table.insert(possibleParts, p) end
+                            end
+                            targetPart = #possibleParts > 0 and possibleParts[math.random(1, #possibleParts)] or player.Character.HumanoidRootPart
+                        end
+                    end
+                    
+                    if targetPart then
+                        local screenPos, onScreen = camera:WorldToViewportPoint(targetPart.Position)
+                        
+                        if onScreen then
+                            local distance = (Vector2.new(screenPos.X, screenPos.Y) - mouseLocationViewport).Magnitude
+                            if distance <= shortestDistance then
+                                local isVisible, visPos = isCharacterVisible(player.Character, targetPart)
+                                
+                                if isVisible then
+                                    closestEnemy = player.Character
+                                    shortestDistance = distance
+                                    bestTargetPart = targetPart
+                                    bestTargetPos = visPos
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        if closestEnemy and bestTargetPart and bestTargetPos then
+            if lastSeenEnemy == closestEnemy then
+                timeInSight = timeInSight + deltaTime
+            else
+                lastSeenEnemy = closestEnemy
+                timeInSight = 0
+            end
+
+            if timeInSight >= triggerDelay then
+                isAutoShooting = true
+                
+                currentTargetEnemy = closestEnemy
+                currentRandomPart = bestTargetPart
+                
+                local predictedPos = bestTargetPos
+                if bestTargetPart.Velocity.Magnitude > 1 then
+                    predictedPos = predictedPos + (bestTargetPart.Velocity * 0.04) 
+                end
+                
+                if aimMethod == "Mouse" and typeof(mousemoverel) == "function" then
+                    local screenPos = camera:WorldToScreenPoint(predictedPos)
+                    local mousePos = UserInputService:GetMouseLocation()
+                    
+                    local deltaX = (screenPos.X - mousePos.X) * aimSmoothing
+                    local deltaY = (screenPos.Y - mousePos.Y) * aimSmoothing
+                    
+                    mousemoverel(deltaX, deltaY)
+                else
+                    local targetCFrame = CFrame.lookAt(camera.CFrame.Position, predictedPos)
+                    camera.CFrame = camera.CFrame:Lerp(targetCFrame, aimSmoothing) 
+                end
+
+                local currentTime = os.clock()
+                
+                if currentTime - lastAutoShootTime > 0.05 then 
+                    lastAutoShootTime = currentTime
+                    local character = LocalPlayer.Character
+                    local tool = character and character:FindFirstChildOfClass("Tool")
+                    
+                    if hitSoundEnabled then
+                        local soundClone = hitSound:Clone()
+                        soundClone.Parent = game:GetService("SoundService")
+                        soundClone:Play()
+                        game:GetService("Debris"):AddItem(soundClone, 2) 
+                    end
+                    
+                    if typeof(mouse1press) == "function" and typeof(mouse1release) == "function" then
+                        pcall(mouse1press)
+                        task.delay(0.05, function() pcall(mouse1release) end)
+                    elseif typeof(mouse1click) == "function" then 
+                        pcall(mouse1click) 
+                    end
+                    
+                    if tool then
+                        tool:Activate() 
+                    end
+                    
+                    if tracersEnabled and not isShooting then
+                        if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid") and LocalPlayer.Character.Humanoid.Health > 0 then
+                            local startPos = getTracerOrigin()
+                            if startPos then 
+                                createTracer(startPos, bestTargetPos)
+                            end
+                        end
+                    end
+                end
+            end
+        else
+            lastSeenEnemy = nil
+            timeInSight = 0
+        end
+    end
+
+    -- Auto Crouch
+    if autoCrouchEnabled then
+        if isAutoShooting and not isCurrentlyCrouched then
+            isCurrentlyCrouched = true
+            VirtualInputManager:SendKeyEvent(true, crouchKey, false, game)
+        elseif not isAutoShooting and isCurrentlyCrouched then
+            isCurrentlyCrouched = false
+            VirtualInputManager:SendKeyEvent(false, crouchKey, false, game)
+        end
+    end
+
+    -- Dynamic Pattern Recoil Compensator
+    if recoilControlEnabled and (isShooting or isAutoShooting) then
+        if not isAutoShooting then
+            local character = LocalPlayer.Character
+            if character and character:FindFirstChildOfClass("Tool") then
+                
+                local elapsed = os.clock() - sprayStartTime
+                local pullX = 0
+                local pullY = 0
+                
+                if rcsPattern == "AK-47" then
+                    if elapsed < 0.7 then
+                        pullY = recoilStrength * 1.5
+                        pullX = -recoilStrength * 0.3 
+                    elseif elapsed < 1.3 then
+                        pullY = recoilStrength * 0.2
+                        pullX = -recoilStrength * 1.5 
+                    elseif elapsed < 2.0 then
+                        pullY = 0
+                        pullX = recoilStrength * 1.5  
+                    elseif elapsed < 3.0 then
+                        pullY = 0
+                        pullX = -recoilStrength * 1.5 
+                    end
+                else
+                    pullY = recoilStrength
+                    pullX = 0
+                end
+
+                if recoilMethod == "Mouse" and typeof(mousemoverel) == "function" then
+                    mousemoverel(pullX * deltaTime * 100, pullY * deltaTime * 100)
+                else
+                    local camera = workspace.CurrentCamera
+                    camera.CFrame = camera.CFrame * CFrame.Angles(math.rad(-pullY * deltaTime * 10), math.rad(-pullX * deltaTime * 10), 0)
+                end
+            end
+        end
+    end
+end))
+
+-- Handle Player Setup
+local function onPlayerSetup(player)
+    table.insert(connections, player.CharacterAdded:Connect(function(character)
+        task.wait(0.1)
+        updateHighlight(player)
+    end))
+
+    if player.Character then
+        updateHighlight(player)
+    end
+
+    table.insert(connections, player:GetPropertyChangedSignal("Team"):Connect(function()
+        if player.Character then
+            updateHighlight(player)
+        end
+    end))
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    onPlayerSetup(player)
+end
+
+table.insert(connections, Players.PlayerAdded:Connect(onPlayerSetup))
+
+table.insert(connections, LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character then
+            updateHighlight(player)
+        end
+    end
+end))
+
+-- ==========================================
+-- RAYFIELD UI SETUP
+-- ==========================================
+
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Window = Rayfield:CreateWindow({
+    Name = "Revive | Counter Blox",
+    LoadingTitle = "Loading Revive...",
+    LoadingSubtitle = "Premium CS:GO Experience",
+    ConfigurationSaving = { Enabled = false },
+    Discord = { Enabled = false },
+    KeySystem = false
+})
+
+local CombatTab = Window:CreateTab("Combat", 4483362458) 
+local VisualsTab = Window:CreateTab("Visuals", 4483362458)
+local AestheticsTab = Window:CreateTab("Aesthetics", 4483362458)
+local SettingsTab = Window:CreateTab("Settings", 4483362458)
+
+-- ==========================================
+-- 1. COMBAT TAB
+-- ==========================================
+local TriggerBotSection = CombatTab:CreateSection("TriggerBot")
+
+local AutoShootToggle = CombatTab:CreateToggle({
+    Name = "Auto Shoot (TriggerBot)",
+    CurrentValue = false,
+    Flag = "AutoShootToggle",
+    Callback = function(Value) autoShootEnabled = Value end,
+})
+
+local AutoShootKeybind = CombatTab:CreateKeybind({
+    Name = "Toggle Auto Shoot Hotkey",
+    CurrentKeybind = "Q",
+    HoldToInteract = false,
+    Flag = "AutoShootKeybind",
+    Callback = function(Keybind) AutoShootToggle:Set(not autoShootEnabled) end,
+})
+
+local TriggerDelaySlider = CombatTab:CreateSlider({
+    Name = "Triggerbot Delay (Reaction Time)",
+    Range = {0, 1000},
+    Increment = 10,
+    Suffix = "ms",
+    CurrentValue = 0,
+    Flag = "TriggerDelaySlider",
+    Callback = function(Value) triggerDelay = Value / 1000 end,
+})
+
+local AutoCrouchToggle = CombatTab:CreateToggle({
+    Name = "Auto Crouch while Shooting",
+    CurrentValue = false,
+    Flag = "AutoCrouchToggle",
+    Callback = function(Value)
+        autoCrouchEnabled = Value
+        if not Value and isCurrentlyCrouched then
+            isCurrentlyCrouched = false
+            VirtualInputManager:SendKeyEvent(false, crouchKey, false, game)
+        end
+    end,
+})
+
+local CrouchKeyDropdown = CombatTab:CreateDropdown({
+    Name = "Crouch Keybind",
+    Options = {"C", "LeftControl", "LeftShift", "Z"},
+    CurrentOption = {"C"},
+    MultipleOptions = false,
+    Flag = "CrouchKeyDropdown",
+    Callback = function(Option)
+        if Option and Option[1] then crouchKey = Enum.KeyCode[Option[1]] end
+    end,
+})
+
+local AimbotSection = CombatTab:CreateSection("Aimbot Options")
+
+local AimPartDropdown = CombatTab:CreateDropdown({
+    Name = "Target Part",
+    Options = {"Head", "Torso", "Random"},
+    CurrentOption = {"Head"},
+    MultipleOptions = false,
+    Flag = "AimPartDropdown",
+    Callback = function(Option)
+        if Option and Option[1] then
+            aimPartChoice = Option[1]
+            currentTargetEnemy = nil 
+            currentRandomPart = nil
+        end
+    end,
+})
+
+local AimMethodDropdown = CombatTab:CreateDropdown({
+    Name = "Aimbot Method",
+    Options = {"Camera", "Mouse"},
+    CurrentOption = {"Camera"},
+    MultipleOptions = false,
+    Flag = "AimMethodDropdown",
+    Callback = function(Option)
+        if Option and Option[1] then aimMethod = Option[1] end
+    end,
+})
+
+local AimSmoothingSlider = CombatTab:CreateSlider({
+    Name = "Aimbot Speed (Smoothing)",
+    Range = {1, 100},
+    Increment = 1,
+    Suffix = "% speed",
+    CurrentValue = 40,
+    Flag = "AimSmoothingSlider",
+    Callback = function(Value) aimSmoothing = Value / 100 end,
+})
+
+local GameModeDropdown = CombatTab:CreateDropdown({
+    Name = "Targeting Mode (Defuse vs FFA)",
+    Options = {"Team Based", "Free For All"},
+    CurrentOption = {"Team Based"},
+    MultipleOptions = false,
+    Flag = "GameModeDropdown",
+    Callback = function(Option)
+        if Option and Option[1] then gameMode = Option[1] end
+    end,
+})
+
+local FOVSection = CombatTab:CreateSection("Field of View")
+
+local FOVToggle = CombatTab:CreateToggle({
+    Name = "Show FOV Circle",
+    CurrentValue = false,
+    Flag = "FOVToggle",
+    Callback = function(Value)
+        fovCircleEnabled = Value
+        if fovCircle then fovCircle.Visible = Value end
+    end,
+})
+
+local FOVSlider = CombatTab:CreateSlider({
+    Name = "Auto Shoot FOV Size",
+    Range = {10, 500},
+    Increment = 5,
+    Suffix = "px",
+    CurrentValue = 100,
+    Flag = "FOVSlider",
+    Callback = function(Value) fovRadius = Value end,
+})
+
+local RecoilSection = CombatTab:CreateSection("Recoil Control")
+
+local RecoilToggle = CombatTab:CreateToggle({
+    Name = "Recoil Compensator",
+    CurrentValue = false,
+    Flag = "RecoilToggle",
+    Callback = function(Value) recoilControlEnabled = Value end,
+})
+
+local RecoilMethodDropdown = CombatTab:CreateDropdown({
+    Name = "Recoil Method",
+    Options = {"Camera", "Mouse"},
+    CurrentOption = {"Camera"},
+    MultipleOptions = false,
+    Flag = "RecoilMethodDropdown",
+    Callback = function(Option)
+        if Option and Option[1] then recoilMethod = Option[1] end
+    end,
+})
+
+local RecoilPatternDropdown = CombatTab:CreateDropdown({
+    Name = "Recoil Pattern",
+    Options = {"Standard (Pull Down)", "AK-47"},
+    CurrentOption = {"Standard (Pull Down)"},
+    MultipleOptions = false,
+    Flag = "RecoilPatternDropdown",
+    Callback = function(Option)
+        if Option and Option[1] then
+            rcsPattern = Option[1]
+        end
+    end,
+})
+
+local RecoilSlider = CombatTab:CreateSlider({
+    Name = "Compensator Strength",
+    Range = {0, 200}, 
+    Increment = 0.5,
+    Suffix = "Power",
+    CurrentValue = 5,
+    Flag = "RecoilStrengthSlider",
+    Callback = function(Value) recoilStrength = Value end,
+})
+
+-- ==========================================
+-- 2. VISUALS TAB
+-- ==========================================
+local ESPSection = VisualsTab:CreateSection("Player ESP")
+
+local ESPToggle = VisualsTab:CreateToggle({
+    Name = "Team ESP (Wallhack)",
+    CurrentValue = false,
+    Flag = "TeamESPToggle",
+    Callback = function(Value)
+        espEnabled = Value
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player.Character then updateHighlight(player) end
+        end
+    end,
+})
+
+local TextESPToggle = VisualsTab:CreateToggle({
+    Name = "Text & Health Info",
+    CurrentValue = false,
+    Flag = "TextESPToggle",
+    Callback = function(Value)
+        textEspEnabled = Value
+        if not Value then
+            for _, drawings in pairs(espDrawings) do
+                if drawings then 
+                    drawings.text.Visible = false 
+                    drawings.bg.Visible = false
+                    drawings.bar.Visible = false
+                    drawings.outline.Visible = false
+                end
+            end
+        end
+    end,
+})
+
+local TracerSection = VisualsTab:CreateSection("Bullet Tracers")
+
+local TracersToggle = VisualsTab:CreateToggle({
+    Name = "Enable Bullet Tracers",
+    CurrentValue = false,
+    Flag = "BulletTracersToggle",
+    Callback = function(Value) tracersEnabled = Value end,
+})
+
+local TracerColorPicker = VisualsTab:CreateColorPicker({
+    Name = "Tracer Color",
+    Color = Color3.fromRGB(255, 255, 0),
+    Flag = "TracerColorPicker",
+    Callback = function(Value) tracerColor = Value end
+})
+
+local AudioSection = VisualsTab:CreateSection("Hit Sounds")
+
+local HitSoundToggle = VisualsTab:CreateToggle({
+    Name = "Enable Hit / Shoot Sounds",
+    CurrentValue = false,
+    Flag = "HitSoundToggle",
+    Callback = function(Value) hitSoundEnabled = Value end,
+})
+
+local HitSoundDropdown = VisualsTab:CreateDropdown({
+    Name = "Sound Effect",
+    Options = {"Satisfying Bell", "Rust Headshot", "Skeet / Neverlose", "TF2 Pan"},
+    CurrentOption = {"Satisfying Bell"},
+    MultipleOptions = false,
+    Flag = "HitSoundDropdown",
+    Callback = function(Option)
+        if Option and Option[1] then
+            hitSoundChoice = Option[1]
+            if Option[1] == "Satisfying Bell" then hitSound.SoundId = "rbxassetid://1347140027"
+            elseif Option[1] == "Rust Headshot" then hitSound.SoundId = "rbxassetid://504353456"
+            elseif Option[1] == "Skeet / Neverlose" then hitSound.SoundId = "rbxassetid://6548734185"
+            elseif Option[1] == "TF2 Pan" then hitSound.SoundId = "rbxassetid://175065416"
+            end
+        end
+    end,
+})
+
+-- ==========================================
+-- 3. AESTHETICS TAB
+-- ==========================================
+local ViewmodelSection = AestheticsTab:CreateSection("Custom Viewmodel")
+
+local HologramToggle = AestheticsTab:CreateToggle({
+    Name = "Hologram Arms (Viewmodel)",
+    CurrentValue = false,
+    Flag = "HologramToggle",
+    Callback = function(Value) hologramArmsEnabled = Value end,
+})
+
+local HologramStyleDropdown = AestheticsTab:CreateDropdown({
+    Name = "Hologram Style / Texture",
+    Options = {"Solid Neon", "ForceField Aura", "Glassy Ghost", "Golden Foil", "Frozen Ice", "Smooth Plastic", "Cyber-Chrome", "Dark Matter", "Corroded Slime"},
+    CurrentOption = {"ForceField Aura"},
+    MultipleOptions = false,
+    Flag = "HologramStyleDropdown",
+    Callback = function(Option)
+        if Option and Option[1] then hologramStyle = Option[1] end
+    end,
+})
+
+local HologramColorPicker = AestheticsTab:CreateColorPicker({
+    Name = "Hologram Color",
+    Color = Color3.fromRGB(255, 105, 180),
+    Flag = "HologramColorPicker",
+    Callback = function(Value) hologramColor = Value end
+})
+
+local LightingSection = AestheticsTab:CreateSection("World Lighting")
+
+local GalaxyToggle = AestheticsTab:CreateToggle({
+    Name = "Enable Night Mode / Skybox",
+    CurrentValue = false,
+    Flag = "GalaxyToggle",
+    Callback = function(Value)
+        galaxySkyboxEnabled = Value
+        applyGalaxyLighting(Value)
+    end,
+})
+
+local GalaxyVariantDropdown = AestheticsTab:CreateDropdown({
+    Name = "Skybox Variant",
+    Options = {"Nebula (Purple/Pink)", "Deep Space (Cyan/Dark)", "Synthwave (Neon/Retro)", "Crimson Eclipse (Red)", "Matrix (Hacker Green)", "Abyssal Ocean (Deep Blue)", "Void (Pitch Black)"},
+    CurrentOption = {"Nebula (Purple/Pink)"},
+    MultipleOptions = false,
+    Flag = "GalaxyVariantDropdown",
+    Callback = function(Option)
+        if Option and Option[1] then
+            galaxyVariant = Option[1]
+            if galaxySkyboxEnabled then applyGalaxyLighting(true) end
+        end
+    end,
+})
+
+local CameraSection = AestheticsTab:CreateSection("Camera Modifier")
+
+local CameraFOVToggle = AestheticsTab:CreateToggle({
+    Name = "Override Camera FOV",
+    CurrentValue = false,
+    Flag = "CameraFOVToggle",
+    Callback = function(Value) cameraFovEnabled = Value end,
+})
+
+local CameraFOVSlider = AestheticsTab:CreateSlider({
+    Name = "Camera FOV Size",
+    Range = {70, 120},
+    Increment = 1,
+    Suffix = "FOV",
+    CurrentValue = 90,
+    Flag = "CameraFOVSlider",
+    Callback = function(Value) cameraFovValue = Value end,
+})
+
+-- ==========================================
+-- 4. SETTINGS TAB
+-- ==========================================
+local ConfigSection = SettingsTab:CreateSection("Configuration System")
+
+local configName = "Default"
+SettingsTab:CreateInput({
+    Name = "Config File Name",
+    PlaceholderText = "Legit / Rage / HvH",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Text)
+        configName = Text
+    end,
+})
+
+SettingsTab:CreateButton({
+    Name = "Save Config",
+    Callback = function()
+        if not writefile then 
+            Rayfield:Notify({Title = "Error", Content = "Your executor does not support saving files.", Duration = 3})
+            return 
+        end
+
+        local data = {
+            espEnabled = espEnabled,
+            textEspEnabled = textEspEnabled,
+            tracersEnabled = tracersEnabled,
+            tracerColor = {tracerColor.R, tracerColor.G, tracerColor.B},
+            autoShootEnabled = autoShootEnabled,
+            autoCrouchEnabled = autoCrouchEnabled,
+            crouchKey = crouchKey.Name,
+            recoilControlEnabled = recoilControlEnabled,
+            recoilStrength = recoilStrength,
+            recoilMethod = recoilMethod,
+            rcsPattern = rcsPattern,
+            fovCircleEnabled = fovCircleEnabled,
+            fovRadius = fovRadius,
+            gameMode = gameMode,
+            aimPartChoice = aimPartChoice,
+            aimSmoothing = aimSmoothing,
+            aimMethod = aimMethod,
+            hologramArmsEnabled = hologramArmsEnabled,
+            hologramColor = {hologramColor.R, hologramColor.G, hologramColor.B},
+            hologramStyle = hologramStyle,
+            galaxySkyboxEnabled = galaxySkyboxEnabled,
+            galaxyVariant = galaxyVariant,
+            cameraFovEnabled = cameraFovEnabled,
+            cameraFovValue = cameraFovValue,
+            hitSoundEnabled = hitSoundEnabled,
+            hitSoundChoice = hitSoundChoice,
+            triggerDelay = triggerDelay
+        }
+
+        local success, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+        if success then
+            if not isfolder("ReviveConfigs") then makefolder("ReviveConfigs") end
+            writefile("ReviveConfigs/" .. configName .. ".json", encoded)
+            Rayfield:Notify({Title = "Config Saved", Content = "Successfully saved: " .. configName, Duration = 3})
+        end
+    end,
+})
+
+SettingsTab:CreateButton({
+    Name = "Load Config",
+    Callback = function()
+        if not readfile then 
+            Rayfield:Notify({Title = "Error", Content = "Your executor does not support reading files.", Duration = 3})
+            return 
+        end
+        
+        local path = "ReviveConfigs/" .. configName .. ".json"
+        local success, fileData = pcall(function() return readfile(path) end)
+        
+        if not success then
+            Rayfield:Notify({Title = "Error", Content = "Config not found: " .. configName, Duration = 3})
+            return
+        end
+        
+        local decodeSuccess, decoded = pcall(function() return HttpService:JSONDecode(fileData) end)
+        if decodeSuccess and decoded then
+            -- Safely apply all settings to the UI Elements (This automatically updates your variables!)
+            if decoded.espEnabled ~= nil then ESPToggle:Set(decoded.espEnabled) end
+            if decoded.textEspEnabled ~= nil then TextESPToggle:Set(decoded.textEspEnabled) end
+            if decoded.tracersEnabled ~= nil then TracersToggle:Set(decoded.tracersEnabled) end
+            if decoded.tracerColor ~= nil then TracerColorPicker:Set(Color3.new(decoded.tracerColor[1], decoded.tracerColor[2], decoded.tracerColor[3])) end
+            if decoded.autoShootEnabled ~= nil then AutoShootToggle:Set(decoded.autoShootEnabled) end
+            if decoded.autoCrouchEnabled ~= nil then AutoCrouchToggle:Set(decoded.autoCrouchEnabled) end
+            if decoded.crouchKey ~= nil then CrouchKeyDropdown:Set({decoded.crouchKey}) end
+            if decoded.recoilControlEnabled ~= nil then RecoilToggle:Set(decoded.recoilControlEnabled) end
+            if decoded.recoilStrength ~= nil then RecoilSlider:Set(decoded.recoilStrength) end
+            if decoded.recoilMethod ~= nil then RecoilMethodDropdown:Set({decoded.recoilMethod}) end
+            if decoded.rcsPattern ~= nil then RecoilPatternDropdown:Set({decoded.rcsPattern}) end
+            if decoded.fovCircleEnabled ~= nil then FOVToggle:Set(decoded.fovCircleEnabled) end
+            if decoded.fovRadius ~= nil then FOVSlider:Set(decoded.fovRadius) end
+            if decoded.gameMode ~= nil then GameModeDropdown:Set({decoded.gameMode}) end
+            if decoded.aimPartChoice ~= nil then AimPartDropdown:Set({decoded.aimPartChoice}) end
+            if decoded.aimSmoothing ~= nil then AimSmoothingSlider:Set(decoded.aimSmoothing * 100) end
+            if decoded.aimMethod ~= nil then AimMethodDropdown:Set({decoded.aimMethod}) end
+            if decoded.hologramArmsEnabled ~= nil then HologramToggle:Set(decoded.hologramArmsEnabled) end
+            if decoded.hologramColor ~= nil then HologramColorPicker:Set(Color3.new(decoded.hologramColor[1], decoded.hologramColor[2], decoded.hologramColor[3])) end
+            if decoded.hologramStyle ~= nil then HologramStyleDropdown:Set({decoded.hologramStyle}) end
+            if decoded.galaxySkyboxEnabled ~= nil then GalaxyToggle:Set(decoded.galaxySkyboxEnabled) end
+            if decoded.galaxyVariant ~= nil then GalaxyVariantDropdown:Set({decoded.galaxyVariant}) end
+            if decoded.cameraFovEnabled ~= nil then CameraFOVToggle:Set(decoded.cameraFovEnabled) end
+            if decoded.cameraFovValue ~= nil then CameraFOVSlider:Set(decoded.cameraFovValue) end
+            if decoded.hitSoundEnabled ~= nil then HitSoundToggle:Set(decoded.hitSoundEnabled) end
+            if decoded.hitSoundChoice ~= nil then HitSoundDropdown:Set({decoded.hitSoundChoice}) end
+            if decoded.triggerDelay ~= nil then TriggerDelaySlider:Set(decoded.triggerDelay * 1000) end
+
+            Rayfield:Notify({Title = "Config Loaded", Content = "Successfully loaded: " .. configName, Duration = 3})
+        else
+            Rayfield:Notify({Title = "Error", Content = "Config file is corrupted.", Duration = 3})
+        end
+    end,
+})
+
+local SettingsSection = SettingsTab:CreateSection("Utility")
+
+local UnloadButton = SettingsTab:CreateButton({
+    Name = "Unload / Self Destruct",
+    Callback = function()
+        espEnabled = false
+        textEspEnabled = false
+        tracersEnabled = false
+        autoShootEnabled = false
+        autoCrouchEnabled = false
+        recoilControlEnabled = false
+        hologramArmsEnabled = false
+        
+        applyGalaxyLighting(false)
+        
+        if isCurrentlyCrouched then
+            VirtualInputManager:SendKeyEvent(false, crouchKey, false, game)
+            isCurrentlyCrouched = false
+        end
+        
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player.Character then
+                local highlight = player.Character:FindFirstChild("PlayerHighlight")
+                if highlight then highlight:Destroy() end
+            end
+        end
+        
+        for _, conn in ipairs(connections) do
+            if conn.Connected then conn:Disconnect() end
+        end
+        
+        if fovCircle then fovCircle:Remove() end
+        for _, drawings in pairs(espDrawings) do
+            if drawings then 
+                if drawings.text then drawings.text:Remove() end
+                if drawings.bg then drawings.bg:Remove() end
+                if drawings.bar then drawings.bar:Remove() end
+                if drawings.outline then drawings.outline:Remove() end
+            end
+        end
+        table.clear(espDrawings)
+        
+        local camera = workspace.CurrentCamera
+        local viewLight = camera:FindFirstChild("ViewmodelLight")
+        if viewLight then viewLight:Destroy() end
+        
+        if hitSound then hitSound:Destroy() end
+        
+        Rayfield:Destroy()
+    end,
+})
+
+Rayfield:LoadConfiguration()
